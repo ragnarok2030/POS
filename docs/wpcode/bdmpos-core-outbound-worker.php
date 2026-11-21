@@ -5,8 +5,9 @@
  * Install as a PHP snippet, run everywhere. Configure the two constants below.
  * WordPress initiates all network requests; the POS server never calls the shop.
  *
- * Supported actions: order.complete, stock.set. Order creation remains disabled
- * until the existing checkout flow is migrated and verified end-to-end.
+ * Supported actions: order.complete, stock.set, core.request.
+ * If the BDM POS Core plugin is active, this snippet does nothing so it
+ * cannot pull a command and reject order creation.
  * No arbitrary PHP, SQL, URL or WooCommerce REST paths are accepted.
  */
 
@@ -55,7 +56,12 @@ function bdmpos_core_execute_command( $command ) {
 	if ( ! function_exists( 'wc_get_order' ) || ! class_exists( 'WC_Order' ) ) {
 		return new WP_Error( 'woocommerce_unavailable', 'WooCommerce is unavailable.' );
 	}
-	$payload = isset( $command['payload'] ) && is_array( $command['payload'] ) ? $command['payload'] : array();
+	$payload = isset( $command['payload'] ) ? $command['payload'] : array();
+	if ( is_string( $payload ) ) {
+		$decoded = json_decode( $payload, true );
+		$payload = is_array( $decoded ) ? $decoded : array();
+	}
+	if ( ! is_array( $payload ) ) { $payload = array(); }
 	switch ( $command['action'] ) {
 		case 'order.complete':
 			$order_id = absint( $payload['order_id'] ?? 0 );
@@ -65,6 +71,32 @@ function bdmpos_core_execute_command( $command ) {
 				$order->update_status( 'completed', sanitize_text_field( $payload['note'] ?? 'Completed via Bendemen POS.' ), true );
 			}
 			return array( 'order_id' => $order_id, 'status' => wc_get_order( $order_id )->get_status() );
+
+		case 'core.request':
+			$method = isset( $payload['method'] ) ? strtoupper( sanitize_text_field( $payload['method'] ) ) : 'GET';
+			$route = isset( $payload['route'] ) ? (string) $payload['route'] : '';
+			if ( ! in_array( $method, array( 'GET', 'POST', 'PUT', 'PATCH', 'DELETE' ), true ) || 0 !== strpos( $route, '/bdmpos/v1/' ) || false !== strpos( $route, '..' ) || ! preg_match( '#^/bdmpos/v1/[a-zA-Z0-9_/-]+$#', $route ) ) {
+				return array( 'http_status' => 400, 'data' => array( 'message' => 'Ongeldig Core-verzoek.' ) );
+			}
+			$internal = new WP_REST_Request( $method, $route );
+			$internal->set_query_params( isset( $payload['params'] ) && is_array( $payload['params'] ) ? $payload['params'] : array() );
+			if ( in_array( $method, array( 'POST', 'PUT', 'PATCH', 'DELETE' ), true ) ) {
+				$body = isset( $payload['body'] ) && is_array( $payload['body'] ) ? $payload['body'] : array();
+				$internal->set_body_params( $body );
+				$internal->set_json_params( $body );
+				$internal->set_body( wp_json_encode( $body ) );
+				$internal->set_header( 'content-type', 'application/json' );
+			}
+			$secret = defined( 'BDMPOS_CORE_SECRET' ) ? (string) BDMPOS_CORE_SECRET : (string) BDMPOS_POS_COMMAND_SECRET;
+			$internal->set_header( 'x_bdm_pos_secret', $secret );
+			$response = rest_do_request( $internal );
+			if ( is_wp_error( $response ) ) {
+				return array( 'http_status' => 500, 'data' => array( 'message' => $response->get_error_message() ) );
+			}
+			$status = $response instanceof WP_REST_Response ? (int) $response->get_status() : 200;
+			$data = $response instanceof WP_REST_Response ? $response->get_data() : $response;
+			if ( ! is_array( $data ) ) { $data = array( 'message' => 'Interne Core-aanvraag gaf HTTP ' . $status . ' terug.' ); }
+			return array( 'http_status' => $status, 'data' => $data );
 
 		case 'stock.set':
 			$product_id = absint( $payload['product_id'] ?? 0 );
@@ -84,6 +116,7 @@ function bdmpos_core_execute_command( $command ) {
 }
 
 add_action( 'bdmpos_core_process_outbound_commands', function() {
+	if ( class_exists( 'BDMPOS_Core_Worker' ) ) { return; }
 	$lock = 'bdmpos_core_worker_lock';
 	if ( get_transient( $lock ) ) { return; }
 	set_transient( $lock, 1, 50 );
